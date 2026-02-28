@@ -3,8 +3,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { MessageCircle, X, Send, Loader2 } from "lucide-react";
 import { useUser } from "@/context/UserContext";
 
-const GEMINI_KEY = "AIzaSyDhMiZpnC_XnRy-hluoc4daHASOcGmRBS0";
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`;
+const CHAT_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`;
 
 interface Message {
   role: "user" | "assistant";
@@ -27,38 +26,78 @@ export default function ChatBot() {
     if (open) endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, open]);
 
-  const systemContext = `You are Aaddhra's AI legal and platform assistant. User is a ${user?.role || "user"} in ${user?.country || "India"}. 
-Use Indian labor laws (e-Shram, Social Security Code 2020, Floor Wage ₹176/hr) when relevant. 
-Prioritise client scam protection. Be concise, friendly, and helpful. 
-For Indian workers: always reference their rights under Social Security Code 2020, e-Shram UAN benefits, and floor wage protections.
-For clients: emphasise escrow protection, dispute resolution, and AI adjudicator.
-Keep responses under 150 words unless detailed legal info is required.`;
-
   const sendMessage = async () => {
     if (!input.trim() || loading) return;
     const userMsg: Message = { role: "user", content: input.trim() };
-    setMessages(prev => [...prev, userMsg]);
+    const updatedMessages = [...messages, userMsg];
+    setMessages(updatedMessages);
     setInput("");
     setLoading(true);
 
     try {
-      const history = [...messages, userMsg].map(m => ({
-        role: m.role === "assistant" ? "model" : "user",
-        parts: [{ text: m.content }]
-      }));
-
-      const res = await fetch(GEMINI_URL, {
+      const resp = await fetch(CHAT_URL, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+        },
         body: JSON.stringify({
-          system_instruction: { parts: [{ text: systemContext }] },
-          contents: history,
+          messages: updatedMessages.slice(1).map(m => ({ role: m.role, content: m.content })),
+          role: user?.role,
+          country: user?.country,
         }),
       });
 
-      const data = await res.json();
-      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "I'm sorry, I couldn't process that. Please try again.";
-      setMessages(prev => [...prev, { role: "assistant", content: text }]);
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({}));
+        const errMsg = data.error || "Something went wrong. Please try again.";
+        setMessages(prev => [...prev, { role: "assistant", content: errMsg }]);
+        return;
+      }
+
+      if (!resp.body) throw new Error("No response body");
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let textBuffer = "";
+      let streamDone = false;
+      let assistantSoFar = "";
+
+      while (!streamDone) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        textBuffer += decoder.decode(value, { stream: true });
+
+        let newlineIndex: number;
+        while ((newlineIndex = textBuffer.indexOf("\n")) !== -1) {
+          let line = textBuffer.slice(0, newlineIndex);
+          textBuffer = textBuffer.slice(newlineIndex + 1);
+          if (line.endsWith("\r")) line = line.slice(0, -1);
+          if (line.startsWith(":") || line.trim() === "") continue;
+          if (!line.startsWith("data: ")) continue;
+
+          const jsonStr = line.slice(6).trim();
+          if (jsonStr === "[DONE]") { streamDone = true; break; }
+
+          try {
+            const parsed = JSON.parse(jsonStr);
+            const content = parsed.choices?.[0]?.delta?.content as string | undefined;
+            if (content) {
+              assistantSoFar += content;
+              setMessages(prev => {
+                const last = prev[prev.length - 1];
+                if (last?.role === "assistant" && last.content !== STARTER_MESSAGES[0].content) {
+                  return prev.map((m, i) => i === prev.length - 1 ? { ...m, content: assistantSoFar } : m);
+                }
+                return [...prev, { role: "assistant", content: assistantSoFar }];
+              });
+            }
+          } catch {
+            textBuffer = line + "\n" + textBuffer;
+            break;
+          }
+        }
+      }
     } catch {
       setMessages(prev => [...prev, { role: "assistant", content: "Connection error. Please check your internet and try again." }]);
     } finally {
@@ -68,7 +107,6 @@ Keep responses under 150 words unless detailed legal info is required.`;
 
   return (
     <>
-      {/* Floating button */}
       <motion.button
         className="fixed bottom-6 right-6 z-50 w-14 h-14 rounded-full flex items-center justify-center shadow-2xl pulse-ring"
         style={{ background: "linear-gradient(135deg, hsl(43 95% 56%), hsl(38 90% 45%)", color: "hsl(220 20% 7%)" }}
@@ -84,7 +122,6 @@ Keep responses under 150 words unless detailed legal info is required.`;
         </AnimatePresence>
       </motion.button>
 
-      {/* Chat window */}
       <AnimatePresence>
         {open && (
           <motion.div
@@ -94,7 +131,6 @@ Keep responses under 150 words unless detailed legal info is required.`;
             className="fixed bottom-24 right-6 z-50 glass-card flex flex-col overflow-hidden"
             style={{ width: "360px", height: "480px", maxWidth: "calc(100vw - 3rem)", maxHeight: "calc(100vh - 8rem)", border: "1px solid hsl(43 95% 56% / 0.25)" }}
           >
-            {/* Header */}
             <div className="flex items-center gap-3 px-4 py-3 shrink-0" style={{ borderBottom: "1px solid hsl(var(--border))", background: "hsl(43 95% 56% / 0.08)" }}>
               <div className="w-8 h-8 rounded-full flex items-center justify-center" style={{ background: "linear-gradient(135deg, hsl(43 95% 56%), hsl(38 90% 45%))" }}>
                 <span className="text-xs font-bold" style={{ color: "hsl(220 20% 7%)" }}>AI</span>
@@ -102,13 +138,12 @@ Keep responses under 150 words unless detailed legal info is required.`;
               <div>
                 <div className="font-semibold text-sm">Aaddhra Assistant</div>
                 <div className="text-xs flex items-center gap-1" style={{ color: "hsl(var(--muted-foreground))" }}>
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald inline-block" style={{ background: "hsl(160 60% 45%)" }} />
-                  Online · Powered by Gemini
+                  <span className="w-1.5 h-1.5 rounded-full inline-block" style={{ background: "hsl(160 60% 45%)" }} />
+                  Online · Powered by Lovable AI
                 </div>
               </div>
             </div>
 
-            {/* Messages */}
             <div className="flex-1 overflow-y-auto p-4 space-y-3">
               {messages.map((m, i) => (
                 <motion.div
@@ -118,7 +153,7 @@ Keep responses under 150 words unless detailed legal info is required.`;
                   className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
                 >
                   <div
-                    className="max-w-[85%] px-3 py-2 rounded-2xl text-sm leading-relaxed"
+                    className="max-w-[85%] px-3 py-2 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap"
                     style={m.role === "user" ? {
                       background: "linear-gradient(135deg, hsl(43 95% 56%), hsl(38 90% 45%))",
                       color: "hsl(220 20% 7%)",
@@ -144,7 +179,6 @@ Keep responses under 150 words unless detailed legal info is required.`;
               <div ref={endRef} />
             </div>
 
-            {/* Input */}
             <div className="flex gap-2 p-3 shrink-0" style={{ borderTop: "1px solid hsl(var(--border))" }}>
               <input
                 value={input}
